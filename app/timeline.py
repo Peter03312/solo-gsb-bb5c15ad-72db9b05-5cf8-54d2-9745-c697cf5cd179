@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+from bisect import bisect_right
 from calendar import isleap
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -200,6 +201,90 @@ def attribute_exposure(
         Attribution(interval_id, attributed[interval_id], shadowed[interval_id])
         for interval_id in sorted(attributed)
     ]
+
+
+@dataclass(frozen=True)
+class ReconciliationPeriod:
+    """|实测 − 计划| 严格超过允许偏差的一段连续异常时段 [start, end)。"""
+
+    start: datetime
+    end: datetime
+    direction: str  # "over" = 实测高于计划，"under" = 实测低于计划
+
+
+@dataclass(frozen=True)
+class ReconciliationResult:
+    """现场照度对账结果。"""
+
+    positive_lux_hours: float   # 实测高于计划的累计偏差积分
+    negative_lux_hours: float   # 实测低于计划的累计偏差积分（以正数给出）
+    anomaly_hours: float        # |实测 − 计划| 严格超过允许偏差的总时长
+    periods: tuple[ReconciliationPeriod, ...]
+
+
+def reconcile_illuminance(
+    readings: list[tuple[datetime, float]],
+    planned_segments: list[Segment],
+    window_start: datetime,
+    window_end: datetime,
+    tolerance_lux: float,
+) -> ReconciliationResult:
+    """把 计划 / 实测 两条时间线在 [window_start, window_end) 内逐段对账。
+
+    ``readings`` 为按时间严格递增的现场照度读数 (时刻, 照度)：首条时刻须等于
+    窗口起点，每条读数代表从该时刻直到下一条读数（或窗口终点）的恒定实测照度。
+    ``planned_segments`` 为既有照明区间按"重叠取最大照度"合并后的计划时间线，
+    窗口内未排灯时段计划照度为 0。
+
+    两条时间线在所有变化点（实测读数时刻 + 计划片段起止 + 窗口终点）处统一切片，
+    每片取 偏差 = 实测 − 计划，正、负偏差分别积分；|偏差| 严格大于允许偏差的
+    片段计为异常，同方向相邻的异常片段合并为一个连续时段（恰好等于阈值不算异常）。
+    """
+    window_start, window_end = parse_utc(window_start), parse_utc(window_end)
+    read_times = [parse_utc(t) for t, _ in readings]
+    read_lux = [float(x) for _, x in readings]
+    planned = clip_segments(planned_segments, window_start, window_end)
+
+    # 全部变化点：实测读数时刻、计划片段起止、窗口终点
+    points: set[datetime] = {window_start, window_end}
+    points.update(read_times)
+    for seg in planned:
+        points.add(seg.start)
+        points.add(seg.end)
+
+    def measured_lux(at: datetime) -> float:
+        # 读数代表 [该时刻, 下一时刻) 的恒定照度；at 落在窗口内必有对应读数
+        return read_lux[bisect_right(read_times, at) - 1]
+
+    def planned_lux(at: datetime) -> float:
+        for seg in planned:  # 片段已裁剪到窗口内且互不重叠
+            if seg.start <= at < seg.end:
+                return seg.lux
+        return 0.0
+
+    positive = 0.0
+    negative = 0.0
+    anomaly_hours = 0.0
+    periods: list[ReconciliationPeriod] = []
+
+    for seg_start, seg_end in zip(sorted(points), sorted(points)[1:]):
+        if seg_start < window_start or seg_end > window_end:
+            continue
+        duration_h = hours_between(seg_start, seg_end)
+        delta = measured_lux(seg_start) - planned_lux(seg_start)
+        if delta > 0:
+            positive += delta * duration_h
+        elif delta < 0:
+            negative += -delta * duration_h
+        if abs(delta) > tolerance_lux + EPSILON:
+            direction = "over" if delta > 0 else "under"
+            anomaly_hours += duration_h
+            if periods and periods[-1].direction == direction and periods[-1].end == seg_start:
+                periods[-1] = ReconciliationPeriod(periods[-1].start, seg_end, direction)
+            else:
+                periods.append(ReconciliationPeriod(seg_start, seg_end, direction))
+
+    return ReconciliationResult(positive, negative, anomaly_hours, tuple(periods))
 
 
 def integrate(segments: list[Segment]) -> float:

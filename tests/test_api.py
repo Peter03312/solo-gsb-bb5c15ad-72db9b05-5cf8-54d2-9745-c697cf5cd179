@@ -972,3 +972,240 @@ def test_interval_attribution_read_only_and_tz_normalized(client):
 
     # 只读：已存区间不变
     assert client.get(f"/api/v1/showcases/{case_id}/intervals").json() == before_intervals
+
+
+# ------------------------------------------------------------- 现场照度对账
+
+def _post_reconciliation(client, case_id, **overrides):
+    payload = {
+        "start": "2026-03-01T08:00:00Z",
+        "end": "2026-03-01T18:00:00Z",
+        "readings": [
+            {"ts": "2026-03-01T08:00:00Z", "lux": 100},
+            {"ts": "2026-03-01T11:00:00Z", "lux": 0},
+            {"ts": "2026-03-01T14:00:00Z", "lux": 350},
+        ],
+        "tolerance_lux": 50,
+    }
+    payload.update(overrides)
+    return client.post(
+        f"/api/v1/showcases/{case_id}/illuminance-reconciliation", json=payload
+    )
+
+
+def test_illuminance_reconciliation_basic(client):
+    """计划 08-16 @50 + 12-13 @300；实测 08-11@100 / 11-14@0 / 14-18@350。
+
+    正偏差 1450、负偏差 400；恰等于 ±50 的片段不算异常，超阈 5h，
+    under 12-13 与 over 14-18 两个时段。
+    """
+    case_id = _create_case(client, name="对账柜")
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T16:00:00Z", "lux": 50},
+            {"start": "2026-03-01T12:00:00Z", "end": "2026-03-01T13:00:00Z", "lux": 300},
+        ]},
+    )
+    assert r.status_code == 201, r.text
+
+    r = _post_reconciliation(client, case_id)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["showcase_id"] == case_id
+    assert body["showcase_name"] == "对账柜"
+    assert body["start"].startswith("2026-03-01T08:00:00")
+    assert body["end"].startswith("2026-03-01T18:00:00")
+    assert body["tolerance_lux"] == 50.0
+    assert body["positive_lux_hours"] == 1450.0
+    assert body["negative_lux_hours"] == 400.0
+    assert body["anomaly_hours"] == 5.0
+    assert [
+        (p["direction"], p["start"][11:16], p["end"][11:16]) for p in body["periods"]
+    ] == [
+        ("under", "12:00", "13:00"),
+        ("over", "14:00", "18:00"),
+    ]
+    assert all(p["start"].endswith(("+00:00", "Z")) for p in body["periods"])
+
+
+def test_illuminance_reconciliation_merges_same_direction(client):
+    """同一异常方向跨实测读数点连续 → 合并为一个时段。
+
+    计划 08-18 @100；实测 08-12@160、12-18@200，全程 over，容差 50。
+    """
+    case_id = _create_case(client, name="对账合并柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z", "lux": 100}
+        ]},
+    )
+    r = _post_reconciliation(
+        client, case_id,
+        readings=[
+            {"ts": "2026-03-01T08:00:00Z", "lux": 160},
+            {"ts": "2026-03-01T12:00:00Z", "lux": 200},
+        ],
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # 60×4 + 100×6 = 840
+    assert body["positive_lux_hours"] == 840.0
+    assert body["negative_lux_hours"] == 0.0
+    assert body["anomaly_hours"] == 10.0
+    assert [(p["direction"], p["start"][11:16], p["end"][11:16]) for p in body["periods"]] == [
+        ("over", "08:00", "18:00")
+    ]
+
+
+def test_illuminance_reconciliation_exact_threshold_ok(client):
+    """实测恰好比计划高 50 / 低 50：不算异常，异常时长 0、无时段。"""
+    case_id = _create_case(client, name="对账到限柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z", "lux": 100}
+        ]},
+    )
+    r = _post_reconciliation(
+        client, case_id,
+        readings=[
+            {"ts": "2026-03-01T08:00:00Z", "lux": 150},
+            {"ts": "2026-03-01T13:00:00Z", "lux": 50},
+        ],
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["positive_lux_hours"] == 250.0
+    assert body["negative_lux_hours"] == 250.0
+    assert body["anomaly_hours"] == 0.0
+    assert body["periods"] == []
+
+
+def test_illuminance_reconciliation_no_planned_lights(client):
+    """窗口内未排灯：计划照度全程为 0；实测全 0 → 无偏差无异常。"""
+    case_id = _create_case(client, name="对账无灯柜")
+    r = _post_reconciliation(
+        client, case_id,
+        readings=[{"ts": "2026-03-01T08:00:00Z", "lux": 0}],
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["positive_lux_hours"] == 0.0
+    assert body["negative_lux_hours"] == 0.0
+    assert body["anomaly_hours"] == 0.0
+    assert body["periods"] == []
+
+    # 实测 60 lux、容差 50 → 全程 over，异常 10h
+    r = _post_reconciliation(
+        client, case_id,
+        readings=[{"ts": "2026-03-01T08:00:00Z", "lux": 60}],
+    )
+    body = r.json()
+    assert body["positive_lux_hours"] == 600.0
+    assert body["anomaly_hours"] == 10.0
+    assert [p["direction"] for p in body["periods"]] == ["over"]
+
+
+def test_illuminance_reconciliation_validation(client):
+    """窗口反向/零长度、首条不在起点、读数越窗、并列逆序、负照度、负容差 → 422。"""
+    case_id = _create_case(client, name="对账校验柜")
+
+    base_readings = [{"ts": "2026-03-01T08:00:00Z", "lux": 50}]
+
+    # 反向窗口
+    r = _post_reconciliation(
+        client, case_id,
+        start="2026-03-01T18:00:00Z", end="2026-03-01T08:00:00Z",
+        readings=[{"ts": "2026-03-01T18:00:00Z", "lux": 50}],
+    )
+    assert r.status_code == 422 and "结束时间" in r.text
+    # 零长度窗口
+    r = _post_reconciliation(
+        client, case_id,
+        start="2026-03-01T08:00:00Z", end="2026-03-01T08:00:00Z",
+        readings=base_readings,
+    )
+    assert r.status_code == 422
+    # 首条读数不在窗口起点
+    r = _post_reconciliation(
+        client, case_id,
+        readings=[{"ts": "2026-03-01T09:00:00Z", "lux": 50}],
+    )
+    assert r.status_code == 422 and "首条读数" in r.text
+    # 末条读数不早于窗口终点
+    r = _post_reconciliation(
+        client, case_id,
+        readings=[
+            {"ts": "2026-03-01T08:00:00Z", "lux": 50},
+            {"ts": "2026-03-01T18:00:00Z", "lux": 50},
+        ],
+    )
+    assert r.status_code == 422 and "窗口内" in r.text
+    # 读数时刻并列
+    r = _post_reconciliation(
+        client, case_id,
+        readings=[
+            {"ts": "2026-03-01T08:00:00Z", "lux": 50},
+            {"ts": "2026-03-01T08:00:00Z", "lux": 60},
+        ],
+    )
+    assert r.status_code == 422 and "严格递增" in r.text
+    # 读数时刻逆序
+    r = _post_reconciliation(
+        client, case_id,
+        readings=[
+            {"ts": "2026-03-01T08:00:00Z", "lux": 50},
+            {"ts": "2026-03-01T07:00:00Z", "lux": 60},
+        ],
+    )
+    assert r.status_code == 422 and "严格递增" in r.text
+    # 负照度
+    r = _post_reconciliation(
+        client, case_id,
+        readings=[{"ts": "2026-03-01T08:00:00Z", "lux": -1}],
+    )
+    assert r.status_code == 422
+    # 负允许偏差
+    r = _post_reconciliation(client, case_id, tolerance_lux=-5)
+    assert r.status_code == 422
+    # 空读数列表
+    r = _post_reconciliation(client, case_id, readings=[])
+    assert r.status_code == 422
+    # 未知展柜
+    r = _post_reconciliation(client, 4242)
+    assert r.status_code == 404
+
+
+def test_illuminance_reconciliation_read_only_and_tz_normalized(client):
+    """naive 时间视为 UTC、带时区读数归一化；对账全程只读不改库。"""
+    case_id = _create_case(client, name="对账只读柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z", "lux": 100}
+        ]},
+    )
+    before_budget = client.get(
+        f"/api/v1/showcases/{case_id}/budget?day=2026-03-01").json()
+    before_intervals = client.get(f"/api/v1/showcases/{case_id}/intervals").json()
+
+    # naive 起 + 带时区止；读数 10:00 (+02:00) → UTC 08:00，与起点一致；全程实测 160
+    r = _post_reconciliation(
+        client, case_id,
+        start="2026-03-01T08:00:00",
+        end="2026-03-01T20:00:00+02:00",
+        readings=[{"ts": "2026-03-01T10:00:00+02:00", "lux": 160}],
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["start"].startswith("2026-03-01T08:00:00")
+    assert body["end"].startswith("2026-03-01T18:00:00")
+    assert body["positive_lux_hours"] == 600.0  # (160−100)×10
+    assert body["anomaly_hours"] == 10.0
+
+    # 只读：预算与已存区间均不变
+    assert client.get(
+        f"/api/v1/showcases/{case_id}/budget?day=2026-03-01").json() == before_budget
+    assert client.get(f"/api/v1/showcases/{case_id}/intervals").json() == before_intervals

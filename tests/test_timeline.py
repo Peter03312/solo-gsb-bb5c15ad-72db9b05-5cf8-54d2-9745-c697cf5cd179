@@ -12,6 +12,7 @@ from app.timeline import (
     integrate,
     integrate_within,
     merge_intervals,
+    reconcile_illuminance,
     year_bounds,
 )
 
@@ -195,3 +196,97 @@ def test_attribute_exposure_zero_lux_and_empty_window():
     total, attrs = attribute_exposure([], _dt(8), _dt(18))
     assert total == 0.0
     assert attrs == []
+
+
+# ------------------------------------------------------------- 现场照度对账
+
+def test_reconcile_slices_at_all_change_points_and_integrates():
+    # 计划：08-16 @50，12-13 @300（重叠取 max）
+    planned = merge_intervals(
+        [(_dt(8), _dt(16), 50), (_dt(12), _dt(13), 300)]
+    )
+    # 实测：08-11 @100；11-14 @0；14-18 @350
+    readings = [(_dt(8), 100), (_dt(11), 0), (_dt(14), 350)]
+    res = reconcile_illuminance(readings, planned, _dt(8), _dt(18), 50)
+
+    # 正偏差：08-11 +50×3 + 14-16 +300×2 + 16-18 +350×2 = 1450
+    assert res.positive_lux_hours == 1450.0
+    # 负偏差：11-12 −50 + 12-13 −300 + 13-14 −50 = 400
+    assert res.negative_lux_hours == 400.0
+    # 超阈（严格 > 50）：12-13（|−300|）+ 14-18（+300/+350）= 5h；
+    # 08-11 与 11-12、13-14 恰为 ±50 不算异常
+    assert res.anomaly_hours == 5.0
+    assert [(p.direction, p.start, p.end) for p in res.periods] == [
+        ("under", _dt(12), _dt(13)),
+        ("over", _dt(14), _dt(18)),
+    ]
+
+
+def test_reconcile_merges_same_direction_runs_across_change_points():
+    # 计划：08-18 全程 100；实测在计划变化点两侧同为 +60 → 合并为一个 over 时段
+    planned = merge_intervals(
+        [(_dt(8), _dt(13), 100), (_dt(13), _dt(18), 100)]
+    )
+    readings = [(_dt(8), 160), (_dt(13), 160)]
+    res = reconcile_illuminance(readings, planned, _dt(8), _dt(18), 50)
+    assert res.positive_lux_hours == 600.0
+    assert res.negative_lux_hours == 0.0
+    assert res.anomaly_hours == 10.0
+    assert [(p.direction, p.start, p.end) for p in res.periods] == [
+        ("over", _dt(8), _dt(18))
+    ]
+
+
+def test_reconcile_opposite_directions_not_merged():
+    # 计划全程 100；实测 08-12 @160（over），12-18 @40（under），中间无正常段
+    planned = merge_intervals([(_dt(8), _dt(18), 100)])
+    readings = [(_dt(8), 160), (_dt(12), 40)]
+    res = reconcile_illuminance(readings, planned, _dt(8), _dt(18), 50)
+    assert res.anomaly_hours == 10.0
+    assert [(p.direction, p.start, p.end) for p in res.periods] == [
+        ("over", _dt(8), _dt(12)),
+        ("under", _dt(12), _dt(18)),
+    ]
+
+
+def test_reconcile_normal_gap_splits_same_direction_periods():
+    # over → 正常 → over：同方向但不相邻，必须是两个时段
+    planned = merge_intervals([(_dt(8), _dt(18), 100)])
+    readings = [(_dt(8), 160), (_dt(10), 100), (_dt(12), 160), (_dt(14), 100)]
+    res = reconcile_illuminance(readings, planned, _dt(8), _dt(18), 50)
+    assert res.anomaly_hours == 4.0
+    assert [(p.start, p.end) for p in res.periods] == [
+        (_dt(8), _dt(10)),
+        (_dt(12), _dt(14)),
+    ]
+    assert all(p.direction == "over" for p in res.periods)
+
+
+def test_reconcile_unplanned_time_counts_as_zero_planned():
+    # 计划只有 08-10 @50；窗口 08-14 内其余时段计划照度为 0
+    planned = merge_intervals([(_dt(8), _dt(10), 50)])
+    readings = [(_dt(8), 50), (_dt(10), 30)]
+    res = reconcile_illuminance(readings, planned, _dt(8), _dt(14), 10)
+    # 08-10 实测=计划；10-14 计划 0、实测 30 → over 30×4=120，异常 4h
+    assert res.positive_lux_hours == 120.0
+    assert res.negative_lux_hours == 0.0
+    assert res.anomaly_hours == 4.0
+    assert [(p.direction, p.start, p.end) for p in res.periods] == [
+        ("over", _dt(10), _dt(14))
+    ]
+
+    # 完全无计划照明 + 实测 0：正负偏差均为 0、无异常
+    res = reconcile_illuminance([(_dt(8), 0)], [], _dt(8), _dt(18), 10)
+    assert res.positive_lux_hours == res.negative_lux_hours == 0.0
+    assert res.anomaly_hours == 0.0 and res.periods == ()
+
+
+def test_reconcile_exactly_at_tolerance_is_not_anomaly():
+    # 实测恰好 = 计划 ± 阈值：积分照常，异常时长为 0、无异常时段
+    planned = merge_intervals([(_dt(8), _dt(18), 100)])
+    readings = [(_dt(8), 150), (_dt(13), 50)]
+    res = reconcile_illuminance(readings, planned, _dt(8), _dt(18), 50)
+    assert res.positive_lux_hours == 250.0
+    assert res.negative_lux_hours == 250.0
+    assert res.anomaly_hours == 0.0
+    assert res.periods == ()

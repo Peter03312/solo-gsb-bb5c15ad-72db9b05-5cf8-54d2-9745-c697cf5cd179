@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -349,6 +349,102 @@ class IntervalAttributionOut(BaseModel):
     intervals: list[IntervalAttributionItemOut] = Field(
         default_factory=list,
         description="按区间 ID 排序的逐区间归因；无相交区间时为空",
+    )
+
+
+class IlluminanceReadingIn(BaseModel):
+    """一条现场照度读数：从 ``ts`` 起直到下一条读数（或窗口终点）的实测照度。"""
+
+    ts: datetime = Field(description="读数时刻（须位于对账窗口内，首条须等于窗口起点）")
+    lux: float = Field(
+        ge=MIN_LUX, le=MAX_LUX, description="该时刻起的实测照度（lux），不允许负数"
+    )
+
+    @field_validator("lux")
+    @classmethod
+    def _check_lux_finite(cls, v: float) -> float:
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("照度必须是有限数值")
+        return v
+
+
+class IlluminanceReconciliationIn(BaseModel):
+    """现场照度对账请求（只读，不落库）。
+
+    归一化到 UTC 后要求起点早于终点；读数按时间严格递增、首条时刻须等于窗口
+    起点、末条时刻须早于窗口终点（读数可代表到终点的照度），且照度非负；
+    允许偏差值须为非负有限数值。
+    """
+
+    start: datetime = Field(description="对账窗口开始时间；不带时区视为 UTC")
+    end: datetime = Field(description="对账窗口结束时间；不带时区视为 UTC")
+    readings: list[IlluminanceReadingIn] = Field(
+        min_length=1, description="按时间严格递增的现场照度读数"
+    )
+    tolerance_lux: float = Field(
+        ge=0.0, description="允许偏差值（lux）；|实测 − 计划| 严格超过该值才算异常"
+    )
+
+    @field_validator("tolerance_lux")
+    @classmethod
+    def _check_tolerance_finite(cls, v: float) -> float:
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("允许偏差值必须是有限数值")
+        return v
+
+    @model_validator(mode="after")
+    def _check_range(self) -> "IlluminanceReconciliationIn":
+        start, end = to_utc(self.start), to_utc(self.end)
+        if end <= start:
+            raise ValueError("对账窗口结束时间必须晚于开始时间（不接受反向或零长度窗口）")
+
+        normalized = [
+            IlluminanceReadingIn(ts=to_utc(r.ts), lux=r.lux) for r in self.readings
+        ]
+        first_ts = normalized[0].ts
+        if first_ts != start:
+            raise ValueError("首条读数的时刻必须与对账窗口起点一致")
+        prev_ts = first_ts
+        for reading in normalized[1:]:
+            if reading.ts <= prev_ts:
+                raise ValueError("照度读数必须按时间严格递增（不接受并列或逆序时刻）")
+            prev_ts = reading.ts
+        if normalized[-1].ts >= end:
+            raise ValueError("照度读数的时刻必须位于对账窗口内（末条须早于窗口终点）")
+
+        self.start, self.end = start, end
+        self.readings = normalized
+        return self
+
+
+class IlluminanceAnomalyPeriodOut(BaseModel):
+    """|实测 − 计划| 超过允许偏差的一段连续异常时段 [start, end)（UTC）。"""
+
+    start: datetime
+    end: datetime
+    direction: Literal["over", "under"] = Field(
+        description="异常方向：over=实测高于计划，under=实测低于计划"
+    )
+
+
+class IlluminanceReconciliationOut(BaseModel):
+    showcase_id: int
+    showcase_name: str
+    start: datetime = Field(description="归一化到 UTC 的对账窗口起点")
+    end: datetime = Field(description="归一化到 UTC 的对账窗口终点")
+    tolerance_lux: float
+    positive_lux_hours: float = Field(
+        description="实测高于计划的累计偏差积分（lux·hour），即 Σ max(实测−计划, 0)·时长"
+    )
+    negative_lux_hours: float = Field(
+        description="实测低于计划的累计偏差积分（lux·hour），即 Σ max(计划−实测, 0)·时长"
+    )
+    anomaly_hours: float = Field(
+        description="|实测 − 计划| 严格超过允许偏差的总时长（小时）；恰好等于阈值不计入"
+    )
+    periods: list[IlluminanceAnomalyPeriodOut] = Field(
+        default_factory=list,
+        description="按方向合并的连续异常时段（同方向相邻片段合并，反方向分开）",
     )
 
 

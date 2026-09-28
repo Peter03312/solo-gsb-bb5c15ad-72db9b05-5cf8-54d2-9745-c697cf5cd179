@@ -10,6 +10,9 @@ from .schemas import (
     STANDARD_ANNUAL_LIMITS,
     CoverageGapOut,
     ExhibitBudgetOut,
+    IlluminanceAnomalyPeriodOut,
+    IlluminanceReconciliationIn,
+    IlluminanceReconciliationOut,
     IntervalAttributionItemOut,
     IntervalAttributionOut,
     LightingPreviewExhibitOut,
@@ -33,6 +36,7 @@ from .timeline import (
     integrate_within,
     merge_intervals,
     parse_utc,
+    reconcile_illuminance,
     year_bounds,
 )
 
@@ -375,5 +379,40 @@ def build_interval_attribution(
                 shadowed_hours=_r(item.shadowed_hours),
             )
             for item in attributions
+        ],
+    )
+
+
+def build_illuminance_reconciliation(
+    showcase: sqlite3.Row,
+    intervals: list[tuple[int, datetime, datetime, float]],
+    request: IlluminanceReconciliationIn,
+) -> IlluminanceReconciliationOut:
+    """对账窗口内现场实测照度与计划照度（只读，不落库）。
+
+    既有照明区间先按"重叠取最大照度"合并为计划时间线，窗口内未排灯时段计划
+    照度为 0；计划与实测时间线在所有变化点切分，逐段取 实测 − 计划 分别
+    积分正、负偏差，并把 |偏差| 严格超过允许偏差的连续片段按方向合并为
+    异常时段（恰好等于阈值不算异常）。
+    """
+    planned_segments = merge_intervals([(s, e, x) for _, s, e, x in intervals])
+    readings = [(r.ts, r.lux) for r in request.readings]
+    result = reconcile_illuminance(
+        readings, planned_segments, request.start, request.end, request.tolerance_lux
+    )
+    return IlluminanceReconciliationOut(
+        showcase_id=showcase["id"],
+        showcase_name=showcase["name"],
+        start=request.start,
+        end=request.end,
+        tolerance_lux=_r(request.tolerance_lux),
+        positive_lux_hours=_r(result.positive_lux_hours),
+        negative_lux_hours=_r(result.negative_lux_hours),
+        anomaly_hours=_r(result.anomaly_hours),
+        periods=[
+            IlluminanceAnomalyPeriodOut(
+                start=period.start, end=period.end, direction=period.direction
+            )
+            for period in result.periods
         ],
     )
