@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..budget import (
     build_exhibit_preview,
+    build_illuminance_reconciliation,
     build_interval_attribution,
     build_open_hours_coverage,
     build_safe_lux_limit,
@@ -20,6 +21,8 @@ from ..schemas import (
     ExhibitCreate,
     ExhibitOut,
     ExhibitUpdate,
+    IlluminanceReconciliationIn,
+    IlluminanceReconciliationOut,
     IntervalAttributionIn,
     IntervalAttributionOut,
     LightIntervalBulk,
@@ -310,3 +313,19 @@ def interval_attribution(showcase_id: int, body: IntervalAttributionIn, conn=Dep
     # 请求模型已保证 UTC 下为正向且不超过 31 天的闭开窗口
     intervals = load_intervals_in_range(conn, showcase_id, body.start, body.end)
     return build_interval_attribution(showcase, intervals, body.start, body.end)
+
+
+# ------------------------------------------------------------- 现场照度对账
+
+@router.post(
+    "/showcases/{showcase_id}/illuminance-reconciliation",
+    response_model=IlluminanceReconciliationOut,
+    summary="现场照度对账：实测读数对比计划时间线，积分正负偏差并汇总超差时段（只读，不落库）",
+)
+def illuminance_reconciliation(
+    showcase_id: int, body: IlluminanceReconciliationIn, conn=Depends(get_db)
+):
+    showcase = _get_showcase(conn, showcase_id)
+    # 请求模型已保证 UTC 下为正向窗口、读数严格递增且首条位于起点
+    intervals = load_intervals_in_range(conn, showcase_id, body.start, body.end)
+    return build_illuminance_reconciliation(showcase, intervals, body)

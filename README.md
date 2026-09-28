@@ -254,6 +254,54 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/interval-attribution \
 }
 ```
 
+现场照度对账（不落库）：传入对账窗口起止、按时间严格递增的现场照度读数（首条须恰好
+位于窗口起点；每条读数代表从该时刻到下一条读数或窗口终点的实测照度）与允许偏差。
+服务只读取出该展柜已有照明区间，沿用"重叠取最大照度"作为计划照度（未排灯按 0 计），
+把两条时间线在所有变化点切分后按 **实测 − 计划** 逐段积分：
+
+```bash
+curl -s -X POST localhost:8000/api/v1/showcases/1/illuminance-reconciliation \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "start": "2026-09-18T08:00:00Z",
+    "end": "2026-09-18T18:00:00Z",
+    "tolerance_lux": 10,
+    "readings": [
+      {"at": "2026-09-18T08:00:00Z", "lux": 70},
+      {"at": "2026-09-18T10:00:00Z", "lux": 45},
+      {"at": "2026-09-18T12:00:00Z", "lux": 310},
+      {"at": "2026-09-18T13:00:00Z", "lux": 40},
+      {"at": "2026-09-18T16:00:00Z", "lux": 0}
+    ]
+  }'
+```
+
+响应示例（计划 08:00–16:00 @50、12:00–13:00 @300 重叠取 max。08–10 实测 70 为 +20
+超差；10–12 实测 45 为 −5 合规；12–13 的 +10 与 13–16 的 −10 **恰等于阈值不记异常**；
+16:00 后未排灯、实测也是 0。正偏差 20×2+10×1=50 lux·h，负偏差 5×2+10×3=40 lux·h，
+超差总时长 2 小时，连续异常时段按方向合并为一段 `over`）：
+
+```json
+{
+  "showcase_id": 1,
+  "showcase_name": "敦煌展厅A柜",
+  "start": "2026-09-18T08:00:00Z",
+  "end": "2026-09-18T18:00:00Z",
+  "tolerance_lux": 10.0,
+  "positive_lux_hours": 50.0,
+  "negative_lux_hours": 40.0,
+  "over_tolerance_hours": 2.0,
+  "anomalies": [
+    {
+      "start": "2026-09-18T08:00:00Z",
+      "end": "2026-09-18T10:00:00Z",
+      "direction": "over",
+      "duration_hours": 2.0
+    }
+  ]
+}
+```
+
 ## 计算规则
 
 - **时间线合并**：把展柜所有区间的开/关灯时刻作为事件扫描；任意时刻有多盏灯亮，有效照度取
@@ -291,6 +339,17 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/interval-attribution \
   区间**（较暗区间不获归因，只累计 `shadowed_hours` 被遮蔽小时数）。返回窗口有效曝光总量
   `total_lux_hours` 与按区间 ID 排序的逐区间归因（`attributed_lux_hours` /
   `shadowed_hours`）；窗口内无相交区间时总量为 0、列表为空。全程只读，不改动已存区间。
+- **现场照度对账**：`POST .../illuminance-reconciliation` 传入查询起止（UTC 归一化后须
+  起点早于终点）、按时间严格递增的现场照度 `readings` 与非负允许偏差 `tolerance_lux`。
+  首条读数必须恰好位于窗口起点，所有读数时刻必须位于窗口内（不接受落在终点的读数），
+  读数照度非负；每条读数代表从该时刻到下一条读数（或窗口终点）的实测照度。已有照明
+  区间只读取出并按"重叠取最大照度"合并为**计划**时间线，跨界区间裁剪到窗口内，未排灯
+  时段计划照度按 0 计算。把计划片段起止与实测读数时刻作为全部变化点统一切片，每片
+  照度恒定，按 `偏差 = 实测 − 计划` 逐段积分：正偏差累计为 `positive_lux_hours`、
+  负偏差绝对值累计为 `negative_lux_hours`（均为 lux·hour）；`|偏差|` **严格大于**允许
+  偏差的片段累计为 `over_tolerance_hours`（**恰等于阈值不算异常**），并把同方向、时间
+  相邻的异常片段合并为连续异常时段 `anomalies`（`over`=实测高于计划、`under`=实测低于
+  计划，中间隔着合规片段则断开为两段）。全程只读，不改动已存区间。
 - **时间**：接受带时区 ISO 8601；naive 时间视为 UTC；内部统一 UTC 存储与返回。
 
 ### 敏感度默认年度上限
@@ -311,6 +370,9 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/interval-attribution \
 - **巡检范围**：结束日期早于开始日期、日期跨度超过 7 天（含两端）、开放结束时刻不晚于
   开始时刻（含跨午夜形态）、`min_lux <= 0` → `422`。
 - **曝光归因窗口**：UTC 归一化后 `end <= start`，或窗口跨度超过 31 天 → `422`。
+- **现场照度对账**：UTC 归一化后 `end <= start`；读数列表为空；首条读数不恰好位于窗口
+  起点；读数未按时间严格递增（同时刻 / 倒序）；读数时刻落在终点或窗口之外；读数照度
+  为负；允许偏差为负或非有限值 → `422`。
 - **未知展品 / 未知展柜**：查询或向不存在的展柜提交数据 → `404`。
 - **试算撤去项**：`remove_interval_ids` 含不存在或不属于该展柜的区间 ID → `404`。
 - 非有限数值（NaN / Infinity）→ `422`；重名冲突 → `409`。
@@ -333,6 +395,7 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/interval-attribution \
 | POST | `/api/v1/showcases/{id}/safe-lux-limit` | **安全照度上限**（计划时段可追加的最大整数照度，不落库） |
 | POST | `/api/v1/showcases/{id}/open-hours-coverage` | **开放时段照明覆盖巡检**（逐日缺口/达标小时数/达标比例，不落库） |
 | POST | `/api/v1/showcases/{id}/interval-attribution` | **窗口曝光归因**（最亮者平分曝光、较暗者记遮蔽小时数，不落库） |
+| POST | `/api/v1/showcases/{id}/illuminance-reconciliation` | **现场照度对账**（实测 vs 计划逐段积分正负偏差、超差时长与连续异常时段，不落库） |
 | GET | `/api/v1/showcases/{id}/intervals?day=YYYY-MM-DD` | 区间查询，**可按日期过滤** |
 | GET | `/api/v1/showcases/{id}/budget?day=YYYY-MM-DD` | **按展柜 + 日期查预算** |
 | GET | `/api/v1/exhibits/{id}/budget?day=YYYY-MM-DD` | 按单件展品查预算 |
@@ -353,7 +416,7 @@ app/
 └── routers/
     ├── showcases.py   # 展柜 / 展品 / 照明区间
     └── reports.py     # 预算查询
-tests/                 # pytest：算法单测 + API 集成测试（56 项）
+tests/                 # pytest：算法单测 + API 集成测试（68 项）
 Dockerfile             # python:3.12-slim + HEALTHCHECK
 docker-compose.yml     # 单命令启动 + 数据卷
 ```
@@ -369,4 +432,6 @@ pytest -q
 未知展柜拒绝、按日期过滤、安全照度上限（二分最大整数照度、瓶颈展品、现状超限不可行、跨年
 时段拒绝、只读性）、开放时段巡检（缺口合并、跨日区间裁剪、恰好达到门槛、完全无灯、范围与
 门槛校验、只读性）、窗口曝光归因（重叠取 max 与遮蔽计时、并列最亮平分、跨界裁剪、0 lux
-区间、31 天窗口校验、只读性）、重启持久化等。
+区间、31 天窗口校验、只读性）、现场照度对账（正负偏差逐段积分、未排灯按 0、同方向连续
+异常合并与合规段断开、计划/实测变化点统一切片、跨界裁剪、恰等于阈值不记异常、窗口与读数
+校验、时区归一化、只读性）、重启持久化等。

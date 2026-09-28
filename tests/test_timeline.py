@@ -4,6 +4,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from app.timeline import (
+    DEVIATION_OVER,
+    DEVIATION_UNDER,
+    DeviationAnomaly,
     Segment,
     attribute_exposure,
     clip_segments,
@@ -12,6 +15,7 @@ from app.timeline import (
     integrate,
     integrate_within,
     merge_intervals,
+    reconcile_illuminance,
     year_bounds,
 )
 
@@ -195,3 +199,79 @@ def test_attribute_exposure_zero_lux_and_empty_window():
     total, attrs = attribute_exposure([], _dt(8), _dt(18))
     assert total == 0.0
     assert attrs == []
+
+
+# ------------------------------------------------------------- 现场照度对账
+
+def test_reconcile_basic_positive_and_negative_deviation():
+    # 计划 08-12 @50；实测 08-10 @80（+30）、10-12 @30（-20）；允许偏差 10
+    plan = merge_intervals([(_dt(8), _dt(12), 50)])
+    readings = [(_dt(8), 80.0), (_dt(10), 30.0)]
+    result = reconcile_illuminance(plan, readings, _dt(8), _dt(12), 10.0)
+    assert result.positive_lux_hours == 60.0
+    assert result.negative_lux_hours == 40.0
+    assert result.over_tolerance_hours == 4.0
+    assert result.anomalies == (
+        DeviationAnomaly(_dt(8), _dt(10), DEVIATION_OVER, 2.0),
+        DeviationAnomaly(_dt(10), _dt(12), DEVIATION_UNDER, 2.0),
+    )
+
+
+def test_reconcile_unscheduled_time_counts_as_zero_plan():
+    # 窗口内完全无排灯：计划按 0 计算；实测 08-10 @20、10-12 @5，允许偏差 10
+    readings = [(_dt(8), 20.0), (_dt(10), 5.0)]
+    result = reconcile_illuminance([], readings, _dt(8), _dt(12), 10.0)
+    assert result.positive_lux_hours == 50.0
+    assert result.negative_lux_hours == 0.0
+    assert result.over_tolerance_hours == 2.0  # 仅 08-10 超差
+    assert result.anomalies == (DeviationAnomaly(_dt(8), _dt(10), DEVIATION_OVER, 2.0),)
+
+
+def test_reconcile_exact_tolerance_is_not_anomaly():
+    # 偏差恰等于阈值不算异常，但仍计入正负偏差积分
+    plan = merge_intervals([(_dt(8), _dt(12), 50)])
+    readings = [(_dt(8), 60.0), (_dt(10), 40.0)]
+    result = reconcile_illuminance(plan, readings, _dt(8), _dt(12), 10.0)
+    assert result.positive_lux_hours == 20.0
+    assert result.negative_lux_hours == 20.0
+    assert result.over_tolerance_hours == 0.0
+    assert result.anomalies == ()
+
+
+def test_reconcile_merges_adjacent_same_direction_anomalies():
+    # 计划 08-14 @50；实测 08-10 @70、10-12 @90、12-14 @45（允许偏差 10）
+    # 前两段同为正偏差且相邻 → 合并为 08-12；12-14 实测 45（-5）合规但计入负偏差
+    plan = merge_intervals([(_dt(8), _dt(14), 50)])
+    readings = [(_dt(8), 70.0), (_dt(10), 90.0), (_dt(12), 45.0)]
+    result = reconcile_illuminance(plan, readings, _dt(8), _dt(14), 10.0)
+    assert result.positive_lux_hours == 20 * 2 + 40 * 2
+    assert result.negative_lux_hours == 5 * 2
+    assert result.over_tolerance_hours == 4.0
+    assert result.anomalies == (DeviationAnomaly(_dt(8), _dt(12), DEVIATION_OVER, 4.0),)
+
+
+def test_reconcile_plan_change_point_splits_reading_step():
+    # 计划 08-10 @50、10-12 @200；实测全程 @100（允许偏差 10）
+    # 08-10: +50 超差；10-12: -100 超差 → 两个方向各一段
+    plan = merge_intervals([(_dt(8), _dt(10), 50), (_dt(10), _dt(12), 200)])
+    readings = [(_dt(8), 100.0)]
+    result = reconcile_illuminance(plan, readings, _dt(8), _dt(12), 10.0)
+    assert result.positive_lux_hours == 100.0
+    assert result.negative_lux_hours == 200.0
+    assert result.over_tolerance_hours == 4.0
+    assert result.anomalies == (
+        DeviationAnomaly(_dt(8), _dt(10), DEVIATION_OVER, 2.0),
+        DeviationAnomaly(_dt(10), _dt(12), DEVIATION_UNDER, 2.0),
+    )
+
+
+def test_reconcile_clips_plan_segments_to_window():
+    # 跨界计划区间 06-09 @50 裁剪到窗口 08-12；实测 08-12 @40（允许偏差 10）
+    plan = merge_intervals([(_dt(6), _dt(9), 50)])
+    readings = [(_dt(8), 40.0)]
+    result = reconcile_illuminance(plan, readings, _dt(8), _dt(12), 10.0)
+    # 08-09: -10 恰好到阈值不记异常；09-12: 未排灯计划按 0，实测 +40 超差
+    assert result.positive_lux_hours == 120.0
+    assert result.negative_lux_hours == 10.0
+    assert result.over_tolerance_hours == 3.0
+    assert result.anomalies == (DeviationAnomaly(_dt(9), _dt(12), DEVIATION_OVER, 3.0),)

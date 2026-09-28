@@ -9,7 +9,10 @@ from .schemas import (
     MAX_LUX,
     STANDARD_ANNUAL_LIMITS,
     CoverageGapOut,
+    DeviationAnomalyOut,
     ExhibitBudgetOut,
+    IlluminanceReconciliationIn,
+    IlluminanceReconciliationOut,
     IntervalAttributionItemOut,
     IntervalAttributionOut,
     LightingPreviewExhibitOut,
@@ -33,6 +36,7 @@ from .timeline import (
     integrate_within,
     merge_intervals,
     parse_utc,
+    reconcile_illuminance,
     year_bounds,
 )
 
@@ -375,5 +379,44 @@ def build_interval_attribution(
                 shadowed_hours=_r(item.shadowed_hours),
             )
             for item in attributions
+        ],
+    )
+
+
+def build_illuminance_reconciliation(
+    showcase: sqlite3.Row,
+    intervals: list[tuple[int, datetime, datetime, float]],
+    request: IlluminanceReconciliationIn,
+) -> IlluminanceReconciliationOut:
+    """把现场照度读数与计划照明时间线对账（只读，不落库）。
+
+    既有照明区间先按"重叠取最大照度"合并为计划时间线（跨界区间裁剪到窗口内，
+    未排灯时段计划照度按 0 计算）；实测读数构成阶梯时间线（每条读数生效到
+    下一条读数或窗口终点）。两条时间线在所有变化点统一切片，逐段积分
+    实测 − 计划：正/负偏差分别累计 lux·hour，|偏差| 严格大于允许偏差的片段
+    累计超差时长，同方向相邻异常片段合并为连续异常时段（恰等于阈值不记异常）。
+    """
+    plan_segments = merge_intervals([(s, e, x) for _, s, e, x in intervals])
+    readings = [(r.at, r.lux) for r in request.readings]
+    result = reconcile_illuminance(
+        plan_segments, readings, request.start, request.end, request.tolerance_lux
+    )
+    return IlluminanceReconciliationOut(
+        showcase_id=showcase["id"],
+        showcase_name=showcase["name"],
+        start=request.start,
+        end=request.end,
+        tolerance_lux=request.tolerance_lux,
+        positive_lux_hours=_r(result.positive_lux_hours),
+        negative_lux_hours=_r(result.negative_lux_hours),
+        over_tolerance_hours=_r(result.over_tolerance_hours),
+        anomalies=[
+            DeviationAnomalyOut(
+                start=a.start,
+                end=a.end,
+                direction=a.direction,
+                duration_hours=_r(a.duration_hours),
+            )
+            for a in result.anomalies
         ],
     )

@@ -17,6 +17,10 @@ from .config import EPSILON
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
+# 现场照度对账的偏差方向：over=实测高于计划（正偏差），under=实测低于计划（负偏差）
+DEVIATION_OVER = "over"
+DEVIATION_UNDER = "under"
+
 
 def parse_utc(value: datetime | str) -> datetime:
     """把库里的 ISO 字符串或 datetime 解析为 UTC datetime。"""
@@ -255,3 +259,98 @@ def day_bounds(day: datetime) -> tuple[datetime, datetime]:
     day = parse_utc(day)
     start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
     return start, start + timedelta(days=1)
+
+
+@dataclass(frozen=True)
+class DeviationAnomaly:
+    """超出允许偏差的连续异常时段（同方向相邻片段已合并）。"""
+
+    start: datetime
+    end: datetime
+    direction: str
+    duration_hours: float
+
+
+@dataclass(frozen=True)
+class IlluminanceReconciliation:
+    """现场照度对账结果：正负偏差积分与超差时段汇总。"""
+
+    positive_lux_hours: float
+    negative_lux_hours: float
+    over_tolerance_hours: float
+    anomalies: tuple[DeviationAnomaly, ...]
+
+
+def reconcile_illuminance(
+    plan_segments: list[Segment],
+    readings: list[tuple[datetime, float]],
+    window_start: datetime,
+    window_end: datetime,
+    tolerance_lux: float,
+) -> IlluminanceReconciliation:
+    """把计划与实测两条时间线对齐，逐段积分 实测 − 计划（只读演算）。
+
+    调用方需保证：``readings`` 按时间严格递增、首条恰为窗口起点、全部落在
+    窗口内（无等于终点者）。第 i 条读数代表 [at_i, at_{i+1})（最后一条延伸到
+    窗口终点）的实测照度。
+
+    计划时间线为既有照明区间合并（重叠取最大照度）后的片段；计划片段之外
+    （含窗口内完全无排灯）照度按 0 计算。两条时间线在所有变化点（计划片段
+    起止与实测读数时刻）统一切片，每片常量照度，``偏差 = 实测 − 计划``：
+    正/负偏差分别乘以时长累计为 lux·hour；偏差绝对值严格大于允许偏差的片段
+    记为异常（**恰等于阈值不算异常**，沿用 EPSILON 抑制浮点噪声），同方向
+    相邻异常片段（中间隔着合规片段则断开）合并为连续异常时段。
+    """
+    window_start, window_end = parse_utc(window_start), parse_utc(window_end)
+    plan = clip_segments(plan_segments, window_start, window_end)
+
+    points = {window_start, window_end}
+    for seg in plan:
+        points.add(seg.start)
+        points.add(seg.end)
+    for at, _lux in readings:
+        points.add(parse_utc(at))
+    ordered = sorted(points)
+
+    positive = 0.0
+    negative = 0.0
+    over_hours = 0.0
+    anomalies: list[DeviationAnomaly] = []
+    reading_idx = 0
+    plan_idx = 0
+
+    for seg_start, seg_end in zip(ordered, ordered[1:]):
+        while reading_idx + 1 < len(readings) and readings[reading_idx + 1][0] <= seg_start:
+            reading_idx += 1
+        while plan_idx < len(plan) and plan[plan_idx].end <= seg_start:
+            plan_idx += 1
+        measured = readings[reading_idx][1]
+        planned = plan[plan_idx].lux if plan_idx < len(plan) and plan[plan_idx].start <= seg_start else 0.0
+
+        diff = measured - planned
+        duration_h = hours_between(seg_start, seg_end)
+        if diff > EPSILON:
+            positive += diff * duration_h
+        elif diff < -EPSILON:
+            negative += -diff * duration_h
+
+        if abs(diff) > tolerance_lux + EPSILON:
+            direction = DEVIATION_OVER if diff > 0 else DEVIATION_UNDER
+            over_hours += duration_h
+            if anomalies and anomalies[-1].direction == direction and anomalies[-1].end == seg_start:
+                prev = anomalies[-1]
+                anomalies[-1] = DeviationAnomaly(
+                    prev.start, seg_end, direction,
+                    prev.duration_hours + duration_h,
+                )
+            else:
+                anomalies.append(
+                    DeviationAnomaly(seg_start, seg_end, direction, duration_h)
+                )
+
+    return IlluminanceReconciliation(
+        positive_lux_hours=positive,
+        negative_lux_hours=negative,
+        over_tolerance_hours=over_hours,
+        anomalies=tuple(anomalies),
+    )
